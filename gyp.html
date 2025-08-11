@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>ガヤピー山風ライダー</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{background:#88c9ff;overflow:hidden;touch-action:none;user-select:none;-webkit-tap-highlight-color:transparent;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Hiragino Sans","Noto Sans JP",sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;flex-direction:column}
+  #ui{position:absolute;inset:0;pointer-events:none;display:flex;justify-content:space-between;align-items:flex-start;padding:12px;font-weight:700;color:#113a5c;text-shadow:0 2px 4px rgba(255,255,255,.6);font-size:18px}
+  #canvas{width:100%;height:100%;display:block}
+  .btn{position:absolute;left:50%;transform:translateX(-50%);padding:12px 20px;border-radius:12px;border:none;cursor:pointer;background:#1456a7;color:#fff;font-weight:700;font-size:18px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+  #startBtn{bottom:22vh}
+  #retryBtn{bottom:22vh;display:none}
+  #title,#result{position:absolute;left:50%;top:18vh;transform:translateX(-50%);text-align:center;color:#0e3a5e;text-shadow:0 3px 12px rgba(255,255,255,.9)}
+  #title h1,#result h2{margin:0 0 10px 0}
+  #title h1{font-size:42px;letter-spacing:2px}
+  #result h2{font-size:32px}
+  #hint{position:absolute;left:50%;transform:translateX(-50%);bottom:12vh;color:#073458;opacity:.9;font-weight:600}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="canvas"></canvas>
+  <div id="ui">
+    <div id="scoreLabel">SCORE 0</div>
+    <div id="timeLabel">TIME 60.0</div>
+  </div>
+
+  <div id="title">
+    <h1>ガヤピー山風ライダー</h1>
+    <div>タップで上昇、離すと下降。<br>リングに触れたら得点。カラスに当たると2秒間落下。</div>
+  </div>
+  <button id="startBtn" class="btn">スタート</button>
+  <div id="hint">画面のどこをタップしても操作できます</div>
+
+  <div id="result" style="display:none;">
+    <h2>タイムアップ！</h2>
+    <div id="finalScore">Score: 0</div>
+  </div>
+  <button id="retryBtn" class="btn">リトライ</button>
+</div>
+
+<script>
+(function(){
+  // Game constants
+  const GAME_TIME = 60.0;
+  const GRAVITY = 1300, FLAP_VY = -430, MAX_VY = 900;
+  const WORLD_SPEED = 180;
+
+  // Rings (original frequency)
+  const RING_SPAWN_START = 1.1;
+  const RING_SPAWN_MIN   = 0.7;
+  const RING_SPAWN_ACCEL = -0.003;
+  const RING_RADIUS = 42, RING_THICK = 10, GOLD_RATE = 0.18;
+  const SCORE_NORMAL = 10, SCORE_GOLD = 30;
+
+  // Crow enemy
+  const CROW_SPAWN_START = 2.6;
+  const CROW_SPAWN_MIN   = 1.4;
+  const CROW_SPAWN_ACCEL = -0.002;
+  const CROW_SPEED = WORLD_SPEED * 1.25;
+  const STUN_TIME = 2.0;
+
+  const DPR = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+
+  // Optional bird images (place gayapi1.png and gayapi2.png in same folder)
+  const ASSET = { bird1:'gayapi1.png', bird2:'gayapi2.png', loaded:false };
+  (function loadBirds(){
+    const img1 = new Image(), img2 = new Image();
+    let ok = 0;
+    img1.onload = ()=>{ ok++; if(ok===2){ASSET.loaded=true;} };
+    img2.onload = ()=>{ ok++; if(ok===2){ASSET.loaded=true;} };
+    img1.onerror = ()=>{ ASSET.bird1 = null; };
+    img2.onerror = ()=>{ ASSET.bird2 = null; };
+    img1.src = ASSET.bird1; img2.src = ASSET.bird2;
+    ASSET.img1 = img1; ASSET.img2 = img2;
+  })();
+
+  // Canvas setup
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  let W=0,H=0;
+  function resize(){
+    W = Math.floor(window.innerWidth * DPR);
+    H = Math.floor(window.innerHeight * DPR);
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+  }
+  window.addEventListener('resize', resize, {passive:true});
+  resize();
+
+  // State
+  let state = 'title';
+  let score = 0, timeLeft = GAME_TIME, lastTimestamp = 0;
+
+  const bird = {
+    x: () => Math.floor(W*0.28),
+    y: 0, vy: 0, r: 26*DPR,
+    flapTimer:0, flapInterval:0.12, frame:0,
+    stunned:false, stunTime:0, angle:0
+  };
+
+  const rings = [];
+  const updrafts = [];
+  const crows = [];
+
+  let ringSpawnInterval = RING_SPAWN_START, ringSpawnTimer = 0;
+  let crowSpawnInterval = CROW_SPAWN_START, crowSpawnTimer = 0;
+
+  function resetGame(){
+    score = 0; timeLeft = GAME_TIME;
+    rings.length = 0; updrafts.length = 0; crows.length = 0;
+    ringSpawnInterval = RING_SPAWN_START; ringSpawnTimer = 0;
+    crowSpawnInterval = CROW_SPAWN_START; crowSpawnTimer = 0;
+    bird.y = Math.floor(H*0.5); bird.vy = 0;
+    bird.flapTimer = 0; bird.frame = 0;
+    bird.stunned = false; bird.stunTime = 0; bird.angle = 0;
+
+    // Updrafts
+    const cols = 3;
+    for(let i=0;i<cols;i++){
+      const w = 80*DPR, h = Math.floor(H*0.45);
+      const x = W + i * Math.floor(W*0.6);
+      const y = Math.floor(H*0.55) - Math.floor(Math.random()*H*0.1);
+      updrafts.push({x,y,w,h,strength:-220,sway:Math.random()*Math.PI*2});
+    }
+    updateLabels();
+  }
+
+  // Input
+  let pressing=false;
+  function press(){ pressing=true; }
+  function release(){ pressing=false; }
+  window.addEventListener('pointerdown',(e)=>{ if(state==='play'){ press(); } e.preventDefault(); },{passive:false});
+  window.addEventListener('pointerup',(e)=>{ if(state==='play'){ release(); } e.preventDefault(); },{passive:false});
+  window.addEventListener('pointercancel',release,{passive:true});
+  window.addEventListener('contextmenu',e=>e.preventDefault());
+
+  // UI
+  const scoreLabel=document.getElementById('scoreLabel');
+  const timeLabel=document.getElementById('timeLabel');
+  const startBtn=document.getElementById('startBtn');
+  const retryBtn=document.getElementById('retryBtn');
+  const titleBox=document.getElementById('title');
+  const resultBox=document.getElementById('result');
+  const finalScore=document.getElementById('finalScore');
+  const hint=document.getElementById('hint');
+
+  startBtn.addEventListener('click', startGame);
+  retryBtn.addEventListener('click', startGame);
+
+  function showTitle(){
+    state='title';
+    titleBox.style.display='';
+    startBtn.style.display='';
+    hint.style.display='';
+    resultBox.style.display='none';
+    retryBtn.style.display='none';
+  }
+  function startGame(){
+    resetGame();
+    state='play';
+    titleBox.style.display='none';
+    startBtn.style.display='none';
+    hint.style.display='none';
+    resultBox.style.display='none';
+    retryBtn.style.display='none';
+    lastTimestamp=performance.now();
+    requestAnimationFrame(loop);
+  }
+  function showResult(){
+    state='gameover';
+    finalScore.textContent='Score: '+score;
+    resultBox.style.display='';
+    retryBtn.style.display='';
+  }
+  function updateLabels(){
+    scoreLabel.textContent='SCORE '+score;
+    timeLabel.textContent='TIME '+timeLeft.toFixed(1);
+  }
+
+  // Spawners
+  function spawnRing(){
+    const marginTop = 80*DPR, marginBot = 90*DPR;
+    const minY = marginTop + RING_RADIUS*DPR;
+    const maxY = H - marginBot - RING_RADIUS*DPR;
+    const y = Math.floor(minY + Math.random()*(maxY-minY));
+    const gold = Math.random() < GOLD_RATE;
+    const r = Math.floor(RING_RADIUS*DPR);
+    const thick = Math.floor(RING_THICK*DPR);
+    rings.push({ x: W + r + 10*DPR, y, r, thick, gold, scored:false });
+  }
+  function spawnCrow(){
+    const marginTop = 70*DPR, marginBot = 110*DPR;
+    const minY = marginTop, maxY = H - marginBot;
+    const y = Math.floor(minY + Math.random()*(maxY-minY));
+    const r = 22*DPR;
+    crows.push({ x: W + 80*DPR, y, r, vx: -CROW_SPEED*(0.95+Math.random()*0.1) });
+  }
+
+  // Loop
+  function loop(ts){
+    const dt = Math.min(0.032,(ts-lastTimestamp)/1000);
+    lastTimestamp = ts;
+
+    timeLeft -= dt;
+    if(timeLeft<=0){ timeLeft=0; updateLabels(); render(); showResult(); return; }
+
+    // Bird
+    if(bird.stunned){
+      bird.stunTime -= dt;
+      bird.angle += dt * 8.0;
+      bird.vy += (GRAVITY*1.3) * dt;
+      if(bird.stunTime <= 0){ bird.stunned=false; bird.angle=0; }
+    }else{
+      if(pressing){ bird.vy = FLAP_VY; }
+      else{ bird.vy = Math.min(MAX_VY, bird.vy + GRAVITY*dt); }
+    }
+    bird.y += bird.vy*dt;
+
+    bird.flapTimer += dt;
+    if(bird.flapTimer >= bird.flapInterval){ bird.flapTimer = 0; bird.frame = 1 - bird.frame; }
+
+    const topBound = bird.r, botBound = H - Math.floor(H*0.12) - bird.r;
+    if(bird.y < topBound){ bird.y=topBound; bird.vy=0; }
+    if(bird.y > botBound){ bird.y=botBound; if(bird.stunned){ bird.vy=0; } else { bird.vy=-220; } }
+
+    // Updrafts
+    for(const u of updrafts){
+      u.x -= WORLD_SPEED*dt; u.sway += dt*0.8; u.y += Math.sin(u.sway)*20*dt*DPR;
+      if(u.x + u.w < -40*DPR){
+        u.x = W + Math.random()*W*0.4 + W*0.5;
+        u.y = Math.floor(H*0.55) - Math.floor(Math.random()*H*0.12);
+      }
+      const bx = bird.x(), by = bird.y;
+      if(!bird.stunned && bx > u.x && bx < u.x+u.w && by > u.y && by < u.y+u.h){
+        bird.vy += u.strength*dt;
+      }
+    }
+
+    // Spawns
+    ringSpawnTimer += dt; if(ringSpawnTimer >= ringSpawnInterval){ ringSpawnTimer=0; spawnRing(); }
+    ringSpawnInterval += RING_SPAWN_ACCEL; if(ringSpawnInterval < RING_SPAWN_MIN) ringSpawnInterval = RING_SPAWN_MIN;
+
+    crowSpawnTimer += dt; if(crowSpawnTimer >= crowSpawnInterval){ crowSpawnTimer=0; spawnCrow(); }
+    crowSpawnInterval += CROW_SPAWN_ACCEL; if(crowSpawnInterval < CROW_SPAWN_MIN) crowSpawnInterval = CROW_SPAWN_MIN;
+
+    // Rings
+    const bx = bird.x(), by = bird.y, br = bird.r;
+    for(const ring of rings){
+      ring.x -= WORLD_SPEED*dt;
+      if(!ring.scored){
+        const dx = ring.x - bx, dy = ring.y - by;
+        const dist = Math.hypot(dx, dy);
+        const outer = ring.r + ring.thick/2 + br;
+        if(dist <= outer){
+          ring.scored = true; // Gray out, do not remove
+          score += ring.gold ? SCORE_GOLD : SCORE_NORMAL;
+          updateLabels();
+        }
+      }
+    }
+    while(rings.length && rings[0].x + rings[0].r < -40*DPR) rings.shift();
+
+    // Crows
+    for(let i=crows.length-1;i>=0;i--){
+      const c = crows[i];
+      c.x += c.vx*dt;
+      if(c.x < -80*DPR){ crows.splice(i,1); continue; }
+      const dx=c.x-bx, dy=c.y-by, dist=Math.hypot(dx,dy);
+      if(dist <= c.r + br && !bird.stunned){
+        bird.stunned = true; bird.stunTime = STUN_TIME; bird.vy = 420; pressing = false;
+      }
+    }
+
+    render();
+    updateLabels();
+    if(state==='play') requestAnimationFrame(loop);
+  }
+
+  // Render
+  function render(){
+    drawSky();
+    drawMountains();
+    for(const u of updrafts) drawUpdraft(u);
+    for(const ring of rings) drawRing(ring); // fixed variable name
+    for(const c of crows)   drawCrow(c);
+
+    // Draw bird only during play
+    if(state === 'play') drawBird();
+  }
+
+  function drawSky(){
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,'#8fd0ff'); g.addColorStop(1,'#d9f0ff');
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  }
+  function drawMountains(){
+    ctx.save();
+    ctx.fillStyle='#73a9d6';
+    const baseY = Math.floor(H*0.72);
+    ctx.beginPath();
+    ctx.moveTo(0,baseY);
+    ctx.lineTo(Math.floor(W*0.25),Math.floor(baseY-120*DPR));
+    ctx.lineTo(Math.floor(W*0.5), Math.floor(baseY-40*DPR));
+    ctx.lineTo(Math.floor(W*0.75),Math.floor(baseY-140*DPR));
+    ctx.lineTo(W,baseY); ctx.lineTo(W,H); ctx.lineTo(0,H); ctx.closePath(); ctx.fill();
+
+    ctx.fillStyle='#4d8a56';
+    const nearY = Math.floor(H*0.82);
+    ctx.beginPath();
+    ctx.moveTo(0,nearY);
+    ctx.lineTo(Math.floor(W*0.2), Math.floor(nearY-60*DPR));
+    ctx.lineTo(Math.floor(W*0.45),Math.floor(nearY-10*DPR));
+    ctx.lineTo(Math.floor(W*0.7), Math.floor(nearY-70*DPR));
+    ctx.lineTo(W,nearY); ctx.lineTo(W,H); ctx.lineTo(0,H); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function drawUpdraft(u){
+    ctx.save();
+    ctx.globalAlpha=0.18; ctx.fillStyle='#ffffff';
+    for(let i=0;i<3;i++){
+      const px = u.x + (i/2)*u.w;
+      const py = u.y + u.h*0.6 + Math.sin(u.sway+i)*18*DPR;
+      ctx.beginPath();
+      ctx.arc(px,py,16*DPR,0,Math.PI*2);
+      ctx.arc(px-26*DPR,py+8*DPR,10*DPR,0,Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+  function drawRing(r){
+    ctx.save();
+    ctx.lineWidth = r.thick;
+    ctx.strokeStyle = r.scored ? '#9aa3ad' : (r.gold ? '#f5b301' : '#2a6fb8');
+    ctx.beginPath(); ctx.arc(r.x,r.y,r.r,0,Math.PI*2); ctx.stroke();
+    ctx.globalAlpha=.23; ctx.strokeStyle='#000';
+    ctx.beginPath(); ctx.arc(r.x+2*DPR,r.y+2*DPR,r.r,0,Math.PI*2); ctx.stroke();
+    ctx.restore();
+  }
+  function drawCrow(c){
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.fillStyle = '#111';
+
+    // Body
+    ctx.beginPath();
+    ctx.moveTo(-18*DPR, -6*DPR);
+    ctx.quadraticCurveTo(0, -20*DPR, 18*DPR, -6*DPR);
+    ctx.quadraticCurveTo(6*DPR, 4*DPR, -10*DPR, 2*DPR);
+    ctx.closePath(); ctx.fill();
+
+    // Wing
+    ctx.beginPath();
+    ctx.moveTo(-4*DPR, -6*DPR);
+    ctx.lineTo(18*DPR, -22*DPR);
+    ctx.lineTo(6*DPR,  -4*DPR);
+    ctx.closePath(); ctx.fill();
+
+    // Beak
+    ctx.beginPath();
+    ctx.moveTo(18*DPR, -6*DPR);
+    ctx.lineTo(26*DPR, -2*DPR);
+    ctx.lineTo(18*DPR,  0);
+    ctx.closePath(); ctx.fill();
+
+    ctx.restore();
+  }
+  function drawBird(){
+    const x = bird.x(), y = bird.y;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(-1, 1); // flip horizontally (left-facing)
+    if(bird.angle!==0) ctx.rotate(bird.angle);
+
+    if(ASSET.loaded && ASSET.img1 && ASSET.img2){
+      const img = bird.frame===0 ? ASSET.img1 : ASSET.img2;
+      const sz = 64*DPR;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, -sz/2, -sz/2, sz, sz);
+      ctx.imageSmoothingEnabled = true;
+    }else{
+      const r = bird.r;
+      ctx.fillStyle='#ffd34a';
+      ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#e58b2b';
+      ctx.beginPath(); ctx.moveTo(r*0.9,-r*0.1); ctx.lineTo(r*1.25,0); ctx.lineTo(r*0.9,r*0.1); ctx.closePath(); ctx.fill();
+      ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(r*0.25,-r*0.2,r*0.22,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#333'; ctx.beginPath(); ctx.arc(r*0.32,-r*0.18,r*0.11,0,Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Boot
+  resetGame(); render(); showTitle();
+})();
+</script>
+</body>
+</html>
